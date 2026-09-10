@@ -1,5 +1,5 @@
 """
-eval_retrieval.py — Retrieval quality evaluation for axiom-rag.
+benchmarks/eval_rag.py — Retrieval quality evaluation for APEX in-process RAG.
 
 Metrics:
     precision@k  — fraction of top-k retrieved chunks whose doc_id appears
@@ -9,17 +9,17 @@ Metrics:
 
 Usage:
     # Evaluate against a live ChromaDB collection (requires GEMINI_API_KEY)
-    python eval/eval_retrieval.py --dataset eval/dataset.json
+    python benchmarks/eval_rag.py --dataset benchmarks/eval_rag_dataset.json
 
     # Specify a non-default collection or chroma path
-    python eval/eval_retrieval.py \
-        --dataset eval/dataset.json \
+    python benchmarks/eval_rag.py \
+        --dataset benchmarks/eval_rag_dataset.json \
         --chroma-path ~/.rag/chroma \
         --collection documents \
         --top-k 5
 
     # Output results as JSON
-    python eval/eval_retrieval.py --dataset eval/dataset.json --json
+    python benchmarks/eval_rag.py --dataset benchmarks/eval_rag_dataset.json --json
 
 Output (default):
     Query                                  P@5     RR
@@ -74,7 +74,7 @@ def mean_reciprocal_rank(scores: list[float]) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Retrieval — thin wrapper over rag.store / rag.embedder
+# Retrieval — thin wrapper over apex.core.rag.store / embedder
 # ---------------------------------------------------------------------------
 
 def retrieve(
@@ -89,10 +89,10 @@ def retrieve(
     Returns list of doc_ids (one per chunk, in rank order).
     """
     try:
-        from rag.config import load_config
-        from rag import embedder, store
+        from apex.core.rag.config import load_config
+        from apex.core.rag import embedder, store
     except ImportError as exc:
-        print(f"error: could not import rag modules — run from the axiom-rag root: {exc}", file=sys.stderr)
+        print(f"error: could not import apex.core.rag modules — install project dependencies: {exc}", file=sys.stderr)
         sys.exit(2)
 
     cfg = load_config(
@@ -191,6 +191,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.top_k <= 0:
+        print("error: --top-k must be greater than 0", file=sys.stderr)
+        sys.exit(1)
 
     api_key = os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
@@ -217,7 +220,7 @@ def main() -> None:
 
         per_query.append({
             "query": query,
-            "relevant_doc_ids": list(relevant),
+            "relevant_doc_ids": sorted(relevant),
             "retrieved_doc_ids": retrieved,
             "precision": round(p_at_k, 4),
             "rr": round(rr, 4),

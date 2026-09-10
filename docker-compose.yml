@@ -1,29 +1,14 @@
 services:
   apex:
-    build: axiom-apex
+    build: .
     environment:
-      GEMINI_API_KEY: ${GEMINI_API_KEY}
-      APEX_API_KEY: ${APEX_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+      APEX_API_KEY: ${APEX_API_KEY:?Set APEX_API_KEY before starting the container}
     ports:
       - "8080:8080"
     volumes:
       - apex_data:/root/.apex
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-
-  ason:
-    build:
-      context: .
-      dockerfile: axiom-ason/Dockerfile
-    environment:
-      APEX_API_KEY: ${APEX_API_KEY:-}
-      APEX_URL: http://apex:8080
-    depends_on:
-      apex:
-        condition: service_healthy
 
 volumes:
   apex_data:

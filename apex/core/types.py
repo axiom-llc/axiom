@@ -1,4 +1,4 @@
-"""Core type definitions for APEX."""
+"""Core immutable types for APEX."""
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -23,8 +23,6 @@ class Plan:
     steps: tuple[Step, ...]
 
 
-# --- Results ---
-
 @dataclass(frozen=True)
 class Ok:
     value: dict[str, Any]
@@ -38,8 +36,6 @@ class Err:
 
 Result = Ok | Err
 
-
-# --- Events (immutable history entries) ---
 
 @dataclass(frozen=True)
 class PlanGeneration:
@@ -65,13 +61,27 @@ class ErrorEvent:
 Event = PlanGeneration | ToolExecution | ErrorEvent
 
 
-# --- Tool ---
-# Note: effect implementations return plain dict.
-# The execution loop is responsible for wrapping in Ok/Err.
-
 @dataclass(frozen=True)
 class Tool:
+    """Describe one executable tool and its planner-visible schema."""
+
     name: str
     input_spec: dict[str, type]
     output_spec: dict[str, type]
     effect: Callable[[dict], dict]
+    required: frozenset[str] | None = None
+
+    @property
+    def required_args(self) -> frozenset[str]:
+        return self.required if self.required is not None else frozenset(self.input_spec)
+
+
+def plan_to_dict(plan: Plan) -> dict[str, Any]:
+    """Serialize a Plan to the stable JSON-compatible representation."""
+    steps: list[dict[str, Any]] = []
+    for step in plan.steps:
+        if isinstance(step, Halt):
+            steps.append({"type": "halt", "reason": step.reason})
+        else:
+            steps.append({"type": "tool", "name": step.name, "args": step.args})
+    return {"goal": plan.goal, "steps": steps}

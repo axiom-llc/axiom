@@ -1,9 +1,0 @@
-Privacy Policy and Data Collection
-
-Axiom LLC collects only the minimum personal data required to fulfill services: name, email address, billing address, and payment method. Payment method details are stored via our PCI-compliant payment processor; raw card data is never stored on Axiom servers.
-
-Usage analytics are collected in aggregate and are not tied to individual identities unless the user has opted in to personalized analytics. Axiom does not sell personal data to third parties.
-
-User data is retained for a maximum of 36 months following account closure. Users may request deletion of their data at any time by submitting a data deletion request to privacy@axiom-llc.com. Deletion is completed within 30 days. Some data may be retained longer if required by applicable law, such as financial transaction records for tax compliance, up to 7 years.
-
-Users may request a copy of their personal data at any time. Data portability requests are fulfilled within 14 business days in JSON or CSV format.

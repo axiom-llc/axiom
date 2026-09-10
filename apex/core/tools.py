@@ -1,41 +1,4 @@
-"""Tool autoloading — scans a directory for Tool instances and merges into registry."""
-from __future__ import annotations
-
-import importlib.util
-import sys
-from pathlib import Path
-
-from apex.core.types import Tool
-
-
-def load_tools_dir(directory: Path) -> dict[str, Tool]:
-    """
-    Import all .py files in directory, collect Tool instances at module level.
-    Returns dict[tool_name, Tool]. Skips files that fail to import.
-    """
-    tools: dict[str, Tool] = {}
-    if not directory.exists():
-        return tools
-
-    for py_file in sorted(directory.glob("*.py")):
-        module_name = f"_apex_user_tool_{py_file.stem}"
-        spec = importlib.util.spec_from_file_location(module_name, py_file)
-        if spec is None or spec.loader is None:
-            continue
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-        except Exception as e:
-            print(f"[toolloader] skipping {py_file.name}: {e}", flush=True)
-            continue
-        for attr_name in dir(module):
-            obj = getattr(module, attr_name)
-            if isinstance(obj, Tool):
-                tools[obj.name] = obj
-
-    return tools
-"""Basic tool implementations."""
+"""Built-in tool implementations."""
 import subprocess
 from pathlib import Path
 
@@ -45,21 +8,20 @@ from apex.core.types import Tool
 
 
 def shell_effect(args: dict) -> dict:
-    result = subprocess.run(
-        args["cmd"], shell=True, capture_output=True, text=True
-    )
+    result = subprocess.run(args["cmd"], shell=True, capture_output=True, text=True)
     return {"stdout": result.stdout, "stderr": result.stderr, "code": result.returncode}
 
 
 def read_file_effect(args: dict) -> dict:
-    return {"content": Path(args["path"]).read_text()}
+    return {"content": Path(args["path"]).read_text(encoding="utf-8")}
 
 
 def write_file_effect(args: dict) -> dict:
     path = Path(args["path"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    bytes_written = path.write_text(args["content"])
-    return {"bytes_written": bytes_written}
+    data = args["content"].encode("utf-8")
+    path.write_bytes(data)
+    return {"bytes_written": len(data)}
 
 
 def http_get_effect(args: dict) -> dict:
@@ -93,16 +55,17 @@ HTTP_GET = Tool(
     input_spec={"url": str, "headers": dict},
     output_spec={"body": str, "status": int},
     effect=http_get_effect,
+    required=frozenset({"url"}),
 )
 
 
 def _rag_multi_query_effect(args: dict) -> dict:
     import json
-    import urllib.request
     import os
+    import urllib.request
 
     question = args["question"]
-    hops = min(int(args.get("hops", 2)), 5)
+    hops = max(1, min(int(args.get("hops", 2)), 5))
     base_url = os.environ.get("RAG_BASE_URL", "http://localhost:8000").rstrip("/")
     token = os.environ.get("RAG_API_TOKEN", "")
     headers = {"Content-Type": "application/json"}
@@ -115,26 +78,26 @@ def _rag_multi_query_effect(args: dict) -> dict:
 
     for hop in range(hops):
         payload = json.dumps({"question": current_question}).encode()
-        req = urllib.request.Request(
+        request = urllib.request.Request(
             f"{base_url}/query",
             data=payload,
             headers=headers,
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read())
-        except Exception as e:
-            return {"error": str(e), "hops_completed": hop, "sources": all_sources}
+            with urllib.request.urlopen(request, timeout=60) as response:
+                data = json.loads(response.read())
+        except Exception as exc:
+            raise RuntimeError(f"RAG request failed at hop {hop + 1}: {exc}") from exc
 
         answer = data.get("answer", "")
         sources = data.get("sources", [])
-        all_sources.extend(s for s in sources if s not in all_sources)
+        all_sources.extend(source for source in sources if source not in all_sources)
         hop_summaries.append(f"[hop {hop + 1}] Q: {current_question}\nA: {answer}")
 
         if hop < hops - 1:
-            lines = [ln.strip() for ln in answer.split("\n") if "?" in ln]
-            current_question = lines[0] if lines else question
+            questions = [line.strip() for line in answer.splitlines() if "?" in line]
+            current_question = questions[0] if questions else question
 
     return {
         "answer": hop_summaries[-1].split("A: ", 1)[-1] if hop_summaries else "",
@@ -149,4 +112,5 @@ RAG_MULTI_QUERY = Tool(
     input_spec={"question": str, "hops": int},
     output_spec={"answer": str, "hops": int, "hop_summaries": list, "sources": list},
     effect=_rag_multi_query_effect,
+    required=frozenset({"question"}),
 )

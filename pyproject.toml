@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "axiom-apex"
 version = "3.0.1"
-description = "Deterministic AI agent runtime — NL to schema-validated plans to reproducible tool execution"
+description = "Deterministic AI agent runtime — NL to schema-validated plans to bounded tool execution"
 authors = [{ name = "AXIOM LLC", email = "axiom.co@proton.me" }]
 readme = "README.md"
 license = { text = "MIT" }
@@ -24,7 +24,6 @@ dependencies = [
     "flask",
     "requests",
     "google-genai",
-    "pydantic>=2.0.0",
     "chromadb>=0.4.0",
 ]
 
@@ -34,7 +33,6 @@ apex = "apex.__main__:main"
 [project.urls]
 Homepage = "https://axiom-llc.github.io"
 Repository = "https://github.com/axiom-llc/axiom-apex"
-Changelog = "https://github.com/axiom-llc/axiom-apex/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["."]

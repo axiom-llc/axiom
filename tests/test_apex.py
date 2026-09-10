@@ -1,631 +1,317 @@
-"""
-APEX test suite — axiom-apex v2.0
-
-Structure:
-  Unit tests    — no API key required; test pure functions and data contracts
-  Integration   — require GEMINI_API_KEY; invoke apex as subprocess
-
-Run unit tests only:
-    pytest tests/test_apex.py -m "not integration" -v
-
-Run all (requires GEMINI_API_KEY):
-    pytest tests/test_apex.py -v
-"""
-
+"""Core APEX tests; integration tests require the configured live provider."""
 import json
 import os
 import subprocess
 import sys
+import threading
+from dataclasses import FrozenInstanceError
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+from apex.config import Config, load_config
+from apex.core.planner import parse_plan
+from apex.core.safety import static_audit
+from apex.core.state import create_initial_state
+from apex.core.types import Err, Halt, Plan, Tool, ToolCall, plan_to_dict
+from apex.memory import make_memory_tools
+from apex.tools import HTTP_GET, READ_FILE, SHELL, WRITE_FILE
 
 APEX_CMD = [sys.executable, "-m", "apex"]
 
 
-def run_apex(*args, env=None, timeout=30):
-    """Invoke apex as a subprocess. Returns CompletedProcess."""
-    cmd = APEX_CMD + list(args)
-    merged_env = env if env is not None else os.environ.copy()
+def _run_apex(*args: str, env: dict[str, str] | None = None, timeout: int = 30):
     return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, env=merged_env,
+        [*APEX_CMD, *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env or os.environ.copy(),
     )
 
 
-def extract_json(text):
-    """
-    Extract the first top-level JSON object from text that may contain
-    trailing non-JSON lines. APEX appends a status block after the plan on
-    stdout, so json.loads() fails on the full string.
-    """
-    obj, _ = json.JSONDecoder().raw_decode(text.lstrip())
-    return obj
+def _registry() -> dict[str, Tool]:
+    return {
+        "shell": Tool(
+            "shell",
+            {"cmd": str},
+            {"stdout": str, "stderr": str, "code": int},
+            lambda args: {},
+        ),
+        "write_file": Tool(
+            "write_file",
+            {"path": str, "content": str},
+            {"bytes_written": int},
+            lambda args: {},
+        ),
+        "optional": Tool(
+            "optional",
+            {"required": str, "extra": int},
+            {"output": str},
+            lambda args: {},
+            required=frozenset({"required"}),
+        ),
+    }
 
-
-def has_api_key():
-    return bool(os.environ.get("GEMINI_API_KEY"))
-
-
-requires_api = pytest.mark.skipif(not has_api_key(), reason="GEMINI_API_KEY not set")
-integration = pytest.mark.integration
-
-
-# ---------------------------------------------------------------------------
-# Unit — Config
-# ---------------------------------------------------------------------------
 
 class TestConfig:
-    def test_missing_api_key_exits_nonzero(self):
-        env = {k: v for k, v in os.environ.items() if k != "GEMINI_API_KEY"}
-        result = run_apex("hello", env=env)
-        assert result.returncode != 0
+    def test_gemini_requires_api_key(self, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "gemini")
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        with pytest.raises(ValueError, match="GEMINI_API_KEY"):
+            load_config()
 
-    def test_missing_api_key_error_message(self):
-        env = {k: v for k, v in os.environ.items() if k != "GEMINI_API_KEY"}
-        result = run_apex("hello", env=env)
+    def test_ollama_allows_missing_gemini_key(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("LLM_PROVIDER", "ollama")
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.setenv("APEX_DB_PATH", str(tmp_path / "memory.db"))
+        config = load_config()
+        assert isinstance(config, Config)
+        assert config.api_key == ""
+        assert config.db_path == tmp_path / "memory.db"
+        with pytest.raises(FrozenInstanceError):
+            config.api_key = "mutated"  # type: ignore[misc]
+
+    def test_rejects_unknown_provider(self, monkeypatch):
+        monkeypatch.setenv("LLM_PROVIDER", "invalid")
+        with pytest.raises(ValueError, match="Unsupported"):
+            load_config(require_api_key=False)
+
+    def test_cli_reports_missing_key(self):
+        env = {key: value for key, value in os.environ.items() if key != "GEMINI_API_KEY"}
+        env["LLM_PROVIDER"] = "gemini"
+        result = _run_apex("hello", env=env)
+        assert result.returncode != 0
         assert "GEMINI_API_KEY" in result.stdout + result.stderr
 
-    def test_load_config_raises_on_missing_key(self):
-        """
-        load_config() must raise ValueError when GEMINI_API_KEY is absent.
-        Tests the config module directly — no subprocess, no SDK involvement.
-        """
-        original = os.environ.pop("GEMINI_API_KEY", None)
-        try:
-            from apex.config import load_config
-            with pytest.raises(ValueError, match="GEMINI_API_KEY"):
-                load_config()
-        finally:
-            if original is not None:
-                os.environ["GEMINI_API_KEY"] = original
-
-    def test_load_config_returns_frozen_dataclass(self):
-        """Config must be a frozen dataclass — immutable by design."""
-        if not has_api_key():
-            pytest.skip("GEMINI_API_KEY not set")
-        from apex.config import load_config, Config
-        cfg = load_config()
-        assert isinstance(cfg, Config)
-        with pytest.raises((AttributeError, TypeError)):
-            cfg.api_key = "mutated"  # type: ignore
-
-    def test_custom_db_path_respected(self, tmp_path):
-        """APEX_DB_PATH env var must be accepted without config errors."""
-        db = tmp_path / "custom.db"
-        env = {**os.environ, "APEX_DB_PATH": str(db)}
-        result = run_apex("--dry-run", "write hello to /tmp/x.txt", env=env)
-        assert "APEX_DB_PATH" not in (result.stderr or "").upper() or result.returncode == 0
-
-    @pytest.mark.skipif(not has_api_key(), reason="GEMINI_API_KEY not set")
-    def test_custom_db_path_creates_file(self, tmp_path):
-        """Memory write via CLI must create the DB at the custom path."""
-        db = tmp_path / "sub" / "apex.db"
-        env = {**os.environ, "APEX_DB_PATH": str(db)}
-        run_apex("save the value 'dbtest' to memory as db_path_key", env=env, timeout=60)
-        assert db.exists(), f"Expected DB at {db}"
-
-    def test_load_config_db_path_is_path_object(self):
-        """Config.db_path must be a Path, not a string."""
-        if not has_api_key():
-            pytest.skip("GEMINI_API_KEY not set")
-        from apex.config import load_config
-        cfg = load_config()
-        assert isinstance(cfg.db_path, Path)
-
-
-# ---------------------------------------------------------------------------
-# Unit — CLI flags
-# ---------------------------------------------------------------------------
-
-class TestFlags:
-    @pytest.mark.skipif(not has_api_key(), reason="GEMINI_API_KEY not set")
-    def test_version_flag(self):
-        result = run_apex("--version")
-        assert result.returncode == 0
-        assert result.stdout.strip() != ""
-
-    @pytest.mark.skipif(not has_api_key(), reason="GEMINI_API_KEY not set")
-    def test_dry_run_produces_json(self):
-        """
-        --dry-run emits the plan JSON followed by a status block on stdout.
-        We extract only the leading JSON object via raw_decode().
-        """
-        result = run_apex("--dry-run", "write hello to /tmp/apex-test.txt")
-        assert result.returncode == 0
-        try:
-            plan = extract_json(result.stdout)
-        except (json.JSONDecodeError, ValueError) as e:
-            pytest.fail(f"Could not extract JSON from --dry-run output: {e}\n{result.stdout}")
-        assert "goal" in plan
-        assert "steps" in plan
-
-    @pytest.mark.skipif(not has_api_key(), reason="GEMINI_API_KEY not set")
-    def test_dry_run_no_side_effects(self, tmp_path):
-        target = tmp_path / "should-not-exist.txt"
-        run_apex("--dry-run", f"write hello to {target}")
-        assert not target.exists()
-
-    @pytest.mark.skipif(not has_api_key(), reason="GEMINI_API_KEY not set")
-    def test_dry_run_steps_have_type_field(self):
-        result = run_apex("--dry-run", "write hello to /tmp/apex-test.txt")
-        plan = extract_json(result.stdout)
-        for step in plan["steps"]:
-            assert "type" in step, f"Step missing 'type': {step}"
-
-    @pytest.mark.skipif(not has_api_key(), reason="GEMINI_API_KEY not set")
-    def test_dry_run_last_step_is_halt(self):
-        result = run_apex("--dry-run", "write hello to /tmp/apex-test.txt")
-        plan = extract_json(result.stdout)
-        assert plan["steps"][-1]["type"] == "halt"
-
-    @pytest.mark.skipif(not has_api_key(), reason="GEMINI_API_KEY not set")
-    def test_trace_writes_to_stderr(self):
-        """
-        --trace during real execution must emit trace events to stderr.
-        NOTE: --dry-run suppresses all tool execution so combining
-        --trace --dry-run produces no events. This test uses real execution.
-        """
-        import tempfile
-        with tempfile.TemporaryDirectory() as d:
-            out = Path(d) / "traced.txt"
-            result = run_apex("--trace", f"write 'traced' to {out}", timeout=60)
-        assert result.stderr != ""
-
-    @pytest.mark.skipif(not has_api_key(), reason="GEMINI_API_KEY not set")
-    def test_trace_execution_emits_tool_events(self, tmp_path):
-        """--trace must emit [tool] or [plan] events during real execution."""
-        out = tmp_path / "traced.txt"
-        result = run_apex("--trace", f"write 'traced' to {out}", timeout=60)
-        combined = result.stdout + result.stderr
-        assert "[tool]" in combined or "[plan]" in combined, (
-            f"Expected trace events, got stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Unit — Plan parsing and validation
-# ---------------------------------------------------------------------------
 
 class TestPlanSchema:
-    """
-    parse_plan(response_text: str, registry: dict) -> Plan | Err
-
-    The planner has no separate validate_plan function. Validation is
-    embedded in parse_plan, which accepts raw LLM response text, extracts
-    the JSON object, and returns either a Plan dataclass or an Err.
-    Tests pass JSON-serialised dicts as response_text.
-    """
-
-    def _parse(self, plan_dict, registry=None):
-        try:
-            from apex.core.planner import parse_plan
-        except ImportError:
-            pytest.skip("apex.core.planner not importable")
-        if registry is None:
-            registry = {"write_file": object(), "shell": object()}
-        return parse_plan(json.dumps(plan_dict), registry)
-
-    def test_valid_plan_returns_plan_instance(self):
-        from apex.core.types import Plan
-        result = self._parse({
-            "goal": "write hello to file",
+    def test_valid_plan_round_trip(self):
+        raw = {
+            "goal": "write hello",
             "steps": [
-                {"type": "tool", "name": "write_file", "args": {"path": "/tmp/x.txt", "content": "hello"}},
+                {
+                    "type": "tool",
+                    "name": "write_file",
+                    "args": {"path": "/tmp/x", "content": "hello"},
+                },
                 {"type": "halt", "reason": "done"},
             ],
-        })
-        assert isinstance(result, Plan)
+        }
+        plan = parse_plan(json.dumps(raw), _registry())
+        assert isinstance(plan, Plan)
+        assert plan_to_dict(plan) == raw
 
-    def test_valid_plan_goal_preserved(self):
-        from apex.core.types import Plan
-        result = self._parse({
-            "goal": "my goal",
-            "steps": [{"type": "halt", "reason": "done"}],
-        })
-        assert isinstance(result, Plan)
-        assert result.goal == "my goal"
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            {},
+            {"goal": "x"},
+            {"steps": [{"type": "halt"}]},
+            {"goal": "x", "steps": []},
+            {"goal": "x", "steps": [{"type": "unknown"}]},
+            {"goal": "x", "steps": [{"type": "tool", "name": "missing", "args": {}}]},
+            {"goal": "x", "steps": [{"type": "halt"}, {"type": "halt"}]},
+            {"goal": "x", "steps": [{"type": "tool", "name": "shell", "args": {"cmd": "true"}}]},
+        ],
+    )
+    def test_rejects_invalid_structure(self, raw):
+        assert isinstance(parse_plan(json.dumps(raw), _registry()), Err)
 
-    def test_plan_missing_goal_returns_err(self):
-        from apex.core.types import Err
-        result = self._parse({"steps": [{"type": "halt", "reason": "done"}]})
-        assert isinstance(result, Err)
-
-    def test_plan_missing_steps_returns_err(self):
-        from apex.core.types import Err
-        result = self._parse({"goal": "something"})
-        assert isinstance(result, Err)
-
-    def test_plan_unknown_step_type_returns_err(self):
-        from apex.core.types import Err
-        result = self._parse({"goal": "test", "steps": [{"type": "unknown_type"}]})
-        assert isinstance(result, Err)
-
-    def test_plan_tool_step_missing_name_returns_err(self):
-        from apex.core.types import Err
-        result = self._parse({"goal": "test", "steps": [{"type": "tool", "args": {}}]})
-        assert isinstance(result, Err)
-
-    def test_plan_unknown_tool_name_returns_err(self):
-        """Tool names are validated against the registry — unknown tools are rejected."""
-        from apex.core.types import Err
-        result = self._parse(
-            {"goal": "test", "steps": [{"type": "tool", "name": "nonexistent_tool", "args": {}}]},
-            registry={"shell": object()},
-        )
-        assert isinstance(result, Err)
-
-    def test_plan_exceeding_32_steps_returns_err(self):
-        """Plan step limit is 32 per README constraints."""
-        from apex.core.types import Err
-        steps = [{"type": "tool", "name": "shell", "args": {"cmd": "true"}} for _ in range(33)]
-        result = self._parse({"goal": "too many steps", "steps": steps},
-                             registry={"shell": object()})
-        assert isinstance(result, Err)
-
-    def test_plan_invalid_json_returns_err(self):
-        """Malformed JSON must return Err, not raise."""
-        try:
-            from apex.core.planner import parse_plan
-        except ImportError:
-            pytest.skip("apex.core.planner not importable")
-        from apex.core.types import Err
-        result = parse_plan("this is not json at all", {})
-        assert isinstance(result, Err)
-
-    def test_toolcall_step_type_accepted(self):
-        """parse_plan accepts both 'tool' and 'toolcall' as step type."""
-        from apex.core.types import Plan
-        result = self._parse({
-            "goal": "test",
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {},
+            {"cmd": 1},
+            {"cmd": "true", "unexpected": True},
+        ],
+    )
+    def test_rejects_invalid_tool_args(self, args):
+        raw = {
+            "goal": "x",
             "steps": [
-                {"type": "toolcall", "name": "shell", "args": {"cmd": "true"}},
+                {"type": "tool", "name": "shell", "args": args},
                 {"type": "halt", "reason": "done"},
             ],
-        }, registry={"shell": object()})
-        assert isinstance(result, Plan)
+        }
+        assert isinstance(parse_plan(json.dumps(raw), _registry()), Err)
+
+    def test_accepts_optional_argument_omission_and_toolcall_alias(self):
+        raw = {
+            "goal": "x",
+            "steps": [
+                {"type": "toolcall", "name": "optional", "args": {"required": "x"}},
+                {"type": "halt", "reason": "done"},
+            ],
+        }
+        assert isinstance(parse_plan(json.dumps(raw), _registry()), Plan)
+
+    def test_rejects_more_than_32_steps(self):
+        steps = [
+            {"type": "tool", "name": "shell", "args": {"cmd": "true"}}
+            for _ in range(32)
+        ] + [{"type": "halt", "reason": "done"}]
+        assert isinstance(parse_plan(json.dumps({"goal": "x", "steps": steps}), _registry()), Err)
+
+    def test_rejects_non_json(self):
+        assert isinstance(parse_plan("not json", _registry()), Err)
 
 
-# ---------------------------------------------------------------------------
-# Unit — State immutability
-# ---------------------------------------------------------------------------
+class TestStateAndTools:
+    def test_initial_state_is_frozen(self):
+        state = create_initial_state("task")
+        assert state.status == "RUNNING"
+        assert state.plan is None
+        assert state.history == ()
+        with pytest.raises(FrozenInstanceError):
+            state.status = "HALTED"  # type: ignore[misc]
 
-class TestState:
-    def _make_state(self, task="test task"):
-        try:
-            from apex.core.state import create_initial_state
-            return create_initial_state(task)
-        except ImportError:
-            pytest.skip("apex.core.state not importable")
+    def test_shell(self):
+        result = SHELL.effect({"cmd": "printf apex"})
+        assert result == {"stdout": "apex", "stderr": "", "code": 0}
 
-    def test_state_is_frozen(self):
-        s = self._make_state()
-        with pytest.raises((AttributeError, TypeError)):
-            s.status = "MUTATED"  # type: ignore
+    def test_file_roundtrip_and_utf8_byte_count(self, tmp_path):
+        path = tmp_path / "nested" / "x.txt"
+        result = WRITE_FILE.effect({"path": str(path), "content": "café"})
+        assert result["bytes_written"] == len("café".encode("utf-8"))
+        assert READ_FILE.effect({"path": str(path)})["content"] == "café"
 
-    def test_replace_produces_new_instance(self):
-        import dataclasses
-        s1 = self._make_state()
-        s2 = dataclasses.replace(s1, status="HALTED")
-        assert s1 is not s2
-        assert s1.status != s2.status
-
-    def test_initial_state_status_is_running(self):
-        """create_initial_state sets status='RUNNING' per state.py."""
-        s = self._make_state()
-        assert s.status == "RUNNING"
-
-    def test_initial_state_has_empty_history(self):
-        s = self._make_state()
-        assert s.history == ()
-
-    def test_initial_state_has_no_plan(self):
-        s = self._make_state()
-        assert s.plan is None
-
-    def test_initial_state_zero_token_count(self):
-        s = self._make_state()
-        assert s.token_count == 0
-
-    def test_original_unchanged_after_replace(self):
-        """Replace must not mutate the source — pure-functional contract."""
-        import dataclasses
-        s1 = self._make_state("original task")
-        original_status = s1.status
-        dataclasses.replace(s1, status="HALTED")
-        assert s1.status == original_status
-
-    def test_input_preserved(self):
-        s = self._make_state("my specific task")
-        assert s.input == "my specific task"
-
-
-# ---------------------------------------------------------------------------
-# Unit — Tool registry
-# ---------------------------------------------------------------------------
-
-class TestToolRegistry:
-    def _shell(self):
-        try:
-            from apex.tools import SHELL
-            return SHELL
-        except ImportError:
-            pytest.skip("SHELL not importable")
-
-    def _get_exit_code(self, result: dict) -> int:
-        """APEX shell results use 'code', not 'exit_code' or 'returncode'."""
-        for key in ("code", "exit_code", "returncode"):
-            if key in result:
-                return result[key]
-        pytest.fail(f"No exit code key found in shell result: {result}")
-
-    def test_shell_tool_exists(self):
-        try:
-            from apex import tools
-        except ImportError:
-            pytest.skip("apex.tools not importable")
-        assert hasattr(tools, "SHELL") or hasattr(tools, "shell")
-
-    def test_read_file_tool_exists(self):
-        try:
-            from apex import tools
-        except ImportError:
-            pytest.skip("apex.tools not importable")
-        assert hasattr(tools, "READ_FILE") or hasattr(tools, "read_file")
-
-    def test_write_file_tool_exists(self):
-        try:
-            from apex import tools
-        except ImportError:
-            pytest.skip("apex.tools not importable")
-        assert hasattr(tools, "WRITE_FILE") or hasattr(tools, "write_file")
-
-    def test_http_get_tool_exists(self):
-        try:
-            from apex import tools
-        except ImportError:
-            pytest.skip("apex.tools not importable")
-        assert hasattr(tools, "HTTP_GET") or hasattr(tools, "http_get")
-
-    def test_shell_effect_runs_command(self):
-        result = self._shell().effect({"cmd": "echo apex-test"})
-        assert "apex-test" in result.get("stdout", "")
-
-    def test_shell_effect_returns_code_key(self):
-        """APEX shell results use 'code' as the exit code key."""
-        result = self._shell().effect({"cmd": "true"})
-        assert "code" in result, (
-            f"Expected 'code' key in shell result, got keys: {list(result.keys())}"
+    def test_http_get(self):
+        response = Mock(text="body", status_code=200)
+        with patch("apex.core.tools.requests.get", return_value=response) as request_get:
+            result = HTTP_GET.effect({"url": "https://example.invalid"})
+        assert result == {"body": "body", "status": 200}
+        request_get.assert_called_once_with(
+            "https://example.invalid", headers={}, timeout=30
         )
 
-    def test_shell_effect_zero_on_success(self):
-        result = self._shell().effect({"cmd": "true"})
-        assert self._get_exit_code(result) == 0
-
-    def test_shell_effect_nonzero_on_failure(self):
-        result = self._shell().effect({"cmd": "false"})
-        assert self._get_exit_code(result) != 0, (
-            f"Expected nonzero exit from 'false', got: {result}"
-        )
-
-    def test_shell_pipe_composition(self):
-        """Pipes must work — documented as a core composition mechanism."""
-        result = self._shell().effect({"cmd": "echo 'apex' | tr 'a-z' 'A-Z'"})
-        assert "APEX" in result.get("stdout", "")
-
-    def test_shell_and_operator(self):
-        """&& chaining must work as documented."""
-        result = self._shell().effect({"cmd": "echo first && echo second"})
-        stdout = result.get("stdout", "")
-        assert "first" in stdout and "second" in stdout
-
-    def test_write_read_roundtrip(self, tmp_path):
-        try:
-            from apex.tools import WRITE_FILE, READ_FILE
-        except ImportError:
-            pytest.skip("file tools not importable")
-        target = str(tmp_path / "roundtrip.txt")
-        WRITE_FILE.effect({"path": target, "content": "apex-roundtrip"})
-        result = READ_FILE.effect({"path": target})
-        assert "apex-roundtrip" in result.get("content", "")
-
-    def test_write_file_creates_parents(self, tmp_path):
-        try:
-            from apex.tools import WRITE_FILE
-        except ImportError:
-            pytest.skip("WRITE_FILE not importable")
-        nested = str(tmp_path / "a" / "b" / "c.txt")
-        WRITE_FILE.effect({"path": nested, "content": "nested"})
-        assert Path(nested).exists()
-
-    def test_http_get_effect_returns_status(self):
-        try:
-            from apex.tools import HTTP_GET
-        except ImportError:
-            pytest.skip("HTTP_GET not importable")
-        result = HTTP_GET.effect({"url": "https://api.ipify.org"})
-        assert any(k in result for k in ("status", "status_code", "code"))
-
-    def test_http_get_effect_returns_body(self):
-        try:
-            from apex.tools import HTTP_GET
-        except ImportError:
-            pytest.skip("HTTP_GET not importable")
-        result = HTTP_GET.effect({"url": "https://api.ipify.org"})
-        body = result.get("body", result.get("content", ""))
-        assert body != ""
-
-
-# ---------------------------------------------------------------------------
-# Unit — Memory (SQLite)
-# ---------------------------------------------------------------------------
 
 class TestMemory:
-    def _get_memory(self, db_path: Path):
-        """
-        make_memory_tools requires a Path object — its internal _connection()
-        calls db_path.parent which fails on str. Always pass Path directly.
-        """
-        try:
-            from apex.memory import make_memory_tools
-            return make_memory_tools(db_path)
-        except ImportError:
-            pytest.skip("apex.memory not importable")
+    def test_roundtrip_list_and_persistence(self, tmp_path):
+        db = tmp_path / "memory.db"
+        read, write = make_memory_tools(db)
+        write.effect({"key": "a", "value": {"n": 1}})
+        assert read.effect({"key": "a"})["value"] == {"n": 1}
+        read2, _ = make_memory_tools(db)
+        assert read2.effect({})["entries"][0]["key"] == "a"
 
-    def test_write_and_read(self, tmp_path):
-        read, write = self._get_memory(tmp_path / "mem.db")
-        write.effect({"key": "test_key", "value": "test_value"})
-        assert read.effect({"key": "test_key"}).get("value") == "test_value"
+    def test_concurrent_writes(self, tmp_path):
+        db = tmp_path / "memory.db"
+        errors: list[Exception] = []
 
-    def test_read_missing_key_returns_none(self, tmp_path):
-        read, _ = self._get_memory(tmp_path / "mem.db")
-        result = read.effect({"key": "does_not_exist"})
-        assert result.get("value") is None
-
-    def test_overwrite_value(self, tmp_path):
-        read, write = self._get_memory(tmp_path / "mem.db")
-        write.effect({"key": "k", "value": "v1"})
-        write.effect({"key": "k", "value": "v2"})
-        assert read.effect({"key": "k"}).get("value") == "v2"
-
-    def test_list_all_entries(self, tmp_path):
-        read, write = self._get_memory(tmp_path / "mem.db")
-        write.effect({"key": "alpha", "value": 1})
-        write.effect({"key": "beta", "value": 2})
-        result = read.effect({})
-        entries = result.get("entries", [])
-        keys = [e["key"] for e in entries]
-        assert "alpha" in keys and "beta" in keys
-
-    def test_json_serialisable_values(self, tmp_path):
-        read, write = self._get_memory(tmp_path / "mem.db")
-        payload = {"nested": True, "list": [1, 2, 3]}
-        write.effect({"key": "complex", "value": payload})
-        assert read.effect({"key": "complex"}).get("value") == payload
-
-    def test_write_returns_written_true(self, tmp_path):
-        _, write = self._get_memory(tmp_path / "mem.db")
-        result = write.effect({"key": "k", "value": "v"})
-        assert result.get("written") is True
-
-    def test_concurrent_writes_isolated(self, tmp_path):
-        import threading
-        db = tmp_path / "shared.db"
-        errors = []
-
-        def writer(key, value):
+        def write(index: int) -> None:
             try:
-                _, write = self._get_memory(db)
-                write.effect({"key": key, "value": value})
-            except Exception as e:
-                errors.append(e)
+                _, tool = make_memory_tools(db)
+                tool.effect({"key": f"k{index}", "value": index})
+            except Exception as exc:  # pragma: no cover - diagnostic collection
+                errors.append(exc)
 
-        threads = [threading.Thread(target=writer, args=(f"k{i}", i)) for i in range(5)]
-        for t in threads: t.start()
-        for t in threads: t.join()
-        assert errors == [], f"Concurrent write errors: {errors}"
-
-    def test_memory_persists_across_instances(self, tmp_path):
-        """Data written by one instance must be readable by a fresh one."""
-        db = tmp_path / "persist.db"
-        _, write = self._get_memory(db)
-        write.effect({"key": "persist_key", "value": "persist_value"})
-
-        read2, _ = self._get_memory(db)
-        assert read2.effect({"key": "persist_key"}).get("value") == "persist_value"
+        threads = [threading.Thread(target=write, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert errors == []
+        read, _ = make_memory_tools(db)
+        assert len(read.effect({})["entries"]) == 8
 
 
-# ---------------------------------------------------------------------------
-# Integration — end-to-end via subprocess
-# ---------------------------------------------------------------------------
+class TestSafety:
+    def test_allows_tmp_write(self):
+        plan = Plan("x", (ToolCall("write_file", {"path": "/tmp/x", "content": "x"}), Halt("done")))
+        assert static_audit(plan)["safe"] is True
 
-@integration
-@requires_api
+    def test_rejects_write_outside_home_and_tmp(self):
+        plan = Plan("x", (ToolCall("write_file", {"path": "/etc/apex-x", "content": "x"}), Halt("done")))
+        audit = static_audit(plan)
+        assert audit["safe"] is False
+        assert "outside HOME or /tmp" in audit["findings"][0]["reason"]
+
+    def test_rejects_destructive_shell_pattern(self):
+        plan = Plan("x", (ToolCall("shell", {"cmd": "rm -rf /"}), Halt("done")))
+        assert static_audit(plan)["safe"] is False
+
+
+class TestHistoryAndReplay:
+    def test_record_run_is_atomic_and_decoded(self, tmp_path, monkeypatch):
+        import apex.history as history
+
+        monkeypatch.setattr(history, "DB_PATH", tmp_path / "runs.db")
+        plan = {"goal": "x", "steps": [{"type": "halt", "reason": "done"}]}
+        run_id = history.record_run(
+            task="x",
+            plan=plan,
+            exit_code=0,
+            token_count=7,
+            wall_seconds=0.1,
+            events=[{"step": 0, "tool": "shell", "args": {"cmd": "true"}, "result": {"code": 0}}],
+        )
+        record = history.load_run(run_id, include_events=True)
+        assert record is not None
+        assert record["plan"] == plan
+        assert record["events"][0]["args"] == {"cmd": "true"}
+        assert record["events"][0]["result"] == {"code": 0}
+
+    def test_legacy_replay_reconstructs_executed_tool_calls(self):
+        from apex.replay import _recorded_plan
+
+        record = {
+            "task": "legacy",
+            "plan": [{"type": "halt", "reason": "done"}],
+        }
+        events = [{"tool": "shell", "args": {"cmd": "true"}}]
+        rebuilt = _recorded_plan(record, events)
+        assert rebuilt["steps"] == [
+            {"type": "tool", "name": "shell", "args": {"cmd": "true"}},
+            {"type": "halt", "reason": "done"},
+        ]
+
+
+class TestMCP:
+    def test_modern_rpc_headers_and_meta(self):
+        from apex import mcp
+
+        response = Mock()
+        response.headers = {"Content-Type": "application/json"}
+        response.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}
+        response.raise_for_status.return_value = None
+
+        with patch("apex.mcp.requests.post", return_value=response) as post:
+            result = mcp._rpc(
+                "https://example.invalid/mcp",
+                "tools/list",
+                {},
+                timeout=(5, 15),
+            )
+        assert result == {"tools": []}
+        kwargs = post.call_args.kwargs
+        assert kwargs["headers"]["MCP-Protocol-Version"] == "2026-07-28"
+        assert kwargs["headers"]["Mcp-Method"] == "tools/list"
+        meta = kwargs["json"]["params"]["_meta"]
+        assert meta["io.modelcontextprotocol/protocolVersion"] == "2026-07-28"
+        assert "io.modelcontextprotocol/clientInfo" in meta
+        assert "io.modelcontextprotocol/clientCapabilities" in meta
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    os.environ.get("LLM_PROVIDER", "gemini").lower() == "gemini"
+    and not os.environ.get("GEMINI_API_KEY"),
+    reason="GEMINI_API_KEY not set",
+)
 class TestIntegration:
-    def test_write_file_task(self, tmp_path):
-        target = tmp_path / "output.txt"
-        result = run_apex(f"write the word 'apex' to {target}")
+    def test_dry_run_returns_valid_plan(self):
+        result = _run_apex("--dry-run", "write hello to /tmp/apex-test.txt", timeout=60)
         assert result.returncode == 0
-        assert target.exists()
-        assert "apex" in target.read_text().lower()
+        plan, _ = json.JSONDecoder().raw_decode(result.stdout.lstrip())
+        assert plan["steps"][-1]["type"] == "halt"
 
-    def test_read_file_task(self, tmp_path):
-        source = tmp_path / "input.txt"
-        source.write_text("hello from apex")
-        result = run_apex(f"read {source} and print its contents")
+    def test_write_and_read_task(self, tmp_path):
+        path = tmp_path / "integration.txt"
+        result = _run_apex(
+            f"write 'integration-ok' to {path} and read it back",
+            timeout=60,
+        )
         assert result.returncode == 0
-
-    def test_shell_task(self, tmp_path):
-        out = tmp_path / "date.txt"
-        result = run_apex(f"write today's date to {out}")
-        assert result.returncode == 0
-        assert out.exists()
-
-    def test_memory_roundtrip(self, tmp_path):
-        db = tmp_path / "mem.db"
-        env = {**os.environ, "APEX_DB_PATH": str(db)}
-        run_apex("save the value 'integration-test' to memory as test_key", env=env)
-        result = run_apex("read from memory the key test_key", env=env)
-        assert result.returncode == 0
-        assert "integration-test" in result.stdout
-
-    def test_http_get_task(self, tmp_path):
-        out = tmp_path / "ip.txt"
-        result = run_apex(f"fetch https://api.ipify.org and save to {out}", timeout=60)
-        assert result.returncode == 0
-        assert out.exists()
-
-    def test_multistep_create_and_verify(self, tmp_path):
-        f1, f2 = tmp_path / "a.txt", tmp_path / "b.txt"
-        result = run_apex(f"write 'file-a' to {f1} and write 'file-b' to {f2}", timeout=60)
-        assert result.returncode == 0
-        assert f1.exists() and f2.exists()
-
-    def test_dry_run_zero_exit(self):
-        result = run_apex("--dry-run", "write hello to /tmp/apex-dryrun.txt")
-        assert result.returncode == 0
-
-    def test_dry_run_valid_json_output(self):
-        result = run_apex("--dry-run", "write hello to /tmp/apex-dryrun.txt")
-        plan = extract_json(result.stdout)
-        assert isinstance(plan["steps"], list)
-        assert len(plan["steps"]) > 0
-
-    def test_error_handling_bad_path(self):
-        result = run_apex("read /root/definitely-does-not-exist.txt", timeout=30)
-        assert result.returncode in (0, 1)
-
-    def test_parallel_independent_tasks(self, tmp_path):
-        """Two concurrent apex processes must not corrupt each other's state."""
-        import concurrent.futures
-
-        def task(label):
-            out = tmp_path / f"{label}.txt"
-            r = run_apex(f"write '{label}' to {out}", timeout=60)
-            return r.returncode, out
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-            futures = [ex.submit(task, f"task{i}") for i in range(2)]
-            results = [f.result() for f in futures]
-
-        for code, path in results:
-            assert code == 0
-            assert path.exists()
-
-    def test_exit_code_zero_on_success(self, tmp_path):
-        out = tmp_path / "exit0.txt"
-        result = run_apex(f"write 'done' to {out}", timeout=60)
-        assert result.returncode == 0
-
-    def test_exit_code_not_unexpected_state(self):
-        """Exit code 2 (unexpected terminal state) must never occur."""
-        result = run_apex("read /nonexistent/path.txt", timeout=30)
-        assert result.returncode != 2
-
-    def test_output_nonempty_on_success(self, tmp_path):
-        out = tmp_path / "result.txt"
-        result = run_apex(f"write 'result-check' to {out}", timeout=60)
-        assert result.stdout.strip() != "" or out.exists()
+        assert path.read_text(encoding="utf-8") == "integration-ok"

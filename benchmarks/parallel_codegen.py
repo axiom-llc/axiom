@@ -1,49 +1,16 @@
 #!/usr/bin/env python3
-"""
-benchmarks/parallel_codegen.py — APEX parallelism benchmark
-
-Measures wall-clock time for sequential vs parallel task execution using
-bash process isolation (apex's native concurrency model).
-
-Each task is a self-contained codegen prompt: generate a Python function
-for a distinct specification and write it to a file.
-
-Usage:
-    # Real mode (requires GEMINI_API_KEY, invokes apex):
-    python benchmarks/parallel_codegen.py
-
-    # Dry-run mode (no API calls, simulates with sleep):
-    python benchmarks/parallel_codegen.py --mock
-
-    # Custom task count:
-    python benchmarks/parallel_codegen.py --tasks 6
-
-    # Cap concurrent processes (default: 4):
-    python benchmarks/parallel_codegen.py --tasks 8 --concurrency 4
-
-Output:
-    JSON to stdout  — machine-readable result
-    Summary to stderr — human-readable
-
-Exit codes:
-    0 — benchmark completed
-    1 — apex not found or API key missing (non-mock mode)
-"""
-
+"""Compare sequential and subprocess-parallel APEX code-generation tasks."""
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NamedTuple
-
-# ---------------------------------------------------------------------------
-# Task definitions
-# ---------------------------------------------------------------------------
 
 TASKS = [
     "write a Python function called 'binary_search' that searches a sorted list",
@@ -55,6 +22,7 @@ TASKS = [
     "write a Python function called 'rate_limit' that enforces calls per second",
     "write a Python function called 'deep_merge' that merges two dicts recursively",
 ]
+_APEX_CMD = [sys.executable, "-m", "apex"]
 
 
 class TaskResult(NamedTuple):
@@ -64,198 +32,132 @@ class TaskResult(NamedTuple):
     output_path: str
 
 
-# ---------------------------------------------------------------------------
-# Runners
-# ---------------------------------------------------------------------------
+def _variance(task: str) -> float:
+    return (zlib.crc32(task.encode("utf-8")) % 100) / 100.0
 
 
 def run_real_task(task: str, output_path: str, timeout: int = 120) -> TaskResult:
-    """Invoke apex for a single task. Blocking."""
-    label = output_path.split("/")[-1]
     prompt = f"{task}. Write only the function (no tests, no explanation) to {output_path}"
     start = time.perf_counter()
     result = subprocess.run(
-        ["apex", prompt],
+        [*_APEX_CMD, prompt],
         capture_output=True,
         text=True,
         timeout=timeout,
     )
-    elapsed = time.perf_counter() - start
-    return TaskResult(label, elapsed, result.returncode, output_path)
+    return TaskResult(Path(output_path).name, time.perf_counter() - start, result.returncode, output_path)
 
 
 def run_mock_task(task: str, output_path: str, latency: float = 2.5) -> TaskResult:
-    """Simulate an apex call with a sleep. Writes a stub file."""
-    label = output_path.split("/")[-1]
     start = time.perf_counter()
-    time.sleep(latency + (hash(task) % 100) / 100)  # slight variance per task
-    Path(output_path).write_text(f"# mock output for: {task}\ndef stub(): pass\n")
-    elapsed = time.perf_counter() - start
-    return TaskResult(label, elapsed, 0, output_path)
-
-
-# ---------------------------------------------------------------------------
-# Sequential execution
-# ---------------------------------------------------------------------------
+    time.sleep(latency + _variance(task))
+    Path(output_path).write_text(f"# mock output for: {task}\ndef stub(): pass\n", encoding="utf-8")
+    return TaskResult(Path(output_path).name, time.perf_counter() - start, 0, output_path)
 
 
 def run_sequential(tasks, work_dir, run_fn) -> tuple[list[TaskResult], float]:
-    results = []
     start = time.perf_counter()
-    for i, task in enumerate(tasks):
-        out = str(Path(work_dir) / f"task_{i:02d}.py")
-        results.append(run_fn(task, out))
-    total = time.perf_counter() - start
-    return results, total
+    results = [
+        run_fn(task, str(Path(work_dir) / f"task_{index:02d}.py"))
+        for index, task in enumerate(tasks)
+    ]
+    return results, time.perf_counter() - start
 
 
-# ---------------------------------------------------------------------------
-# Parallel execution (bash & / wait pattern)
-# ---------------------------------------------------------------------------
-
-
-def run_parallel_bash(
-    tasks, work_dir, mock: bool, latency: float, concurrency: int
-) -> tuple[list[TaskResult], float]:
-    """
-    Spawns apex processes concurrently in batches of `concurrency`,
-    mirroring the bash `cmd & wait` pattern documented in APEX.
-    Batching avoids API rate-limit contention beyond the effective
-    concurrency ceiling (~4 for Gemini 2.5 Flash).
-    """
-    output_paths = [str(Path(work_dir) / f"task_parallel_{i:02d}.py") for i in range(len(tasks))]
-    all_results = []
-    start_wall = time.perf_counter()
-
-    for batch_start in range(0, len(tasks), concurrency):
-        batch_tasks = tasks[batch_start:batch_start + concurrency]
-        batch_paths = output_paths[batch_start:batch_start + concurrency]
-        procs = []
-        start_times = []
-
-        for task, out in zip(batch_tasks, batch_paths):
-            if mock:
-                variance = (hash(task) % 100) / 100
-                sleep_time = latency + variance
-                cmd = [
-                    "python3", "-c",
-                    f"import time, pathlib; time.sleep({sleep_time}); "
-                    f"pathlib.Path('{out}').write_text('# mock\\ndef stub(): pass\\n')"
-                ]
-            else:
-                prompt = f"{task}. Write only the function to {out}"
-                cmd = ["apex", prompt]
-
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            procs.append((proc, out, task))
-            start_times.append(time.perf_counter())
-
-        for (proc, out, task), t_start in zip(procs, start_times):
-            proc.wait()
-            elapsed = time.perf_counter() - t_start
-            label = Path(out).name
-            all_results.append(TaskResult(label, elapsed, proc.returncode, out))
-
-    total_wall = time.perf_counter() - start_wall
-    return all_results, total_wall
-
-
-# ---------------------------------------------------------------------------
-# Validation
-# ---------------------------------------------------------------------------
+def run_parallel(tasks, work_dir, run_fn, concurrency: int) -> tuple[list[TaskResult], float]:
+    jobs = [
+        (task, str(Path(work_dir) / f"task_parallel_{index:02d}.py"))
+        for index, task in enumerate(tasks)
+    ]
+    start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        results = list(pool.map(lambda job: run_fn(*job), jobs))
+    return results, time.perf_counter() - start
 
 
 def validate_outputs(results: list[TaskResult]) -> dict:
-    """Check that each task produced a non-empty output file."""
-    report = {"total": len(results), "success": 0, "missing": [], "empty": []}
-    for r in results:
-        p = Path(r.output_path)
-        if not p.exists():
-            report["missing"].append(r.label)
-        elif p.stat().st_size == 0:
-            report["empty"].append(r.label)
+    report = {"total": len(results), "success": 0, "missing": [], "empty": [], "failed": []}
+    for result in results:
+        path = Path(result.output_path)
+        if result.exit_code != 0:
+            report["failed"].append(result.label)
+        elif not path.exists():
+            report["missing"].append(result.label)
+        elif path.stat().st_size == 0:
+            report["empty"].append(result.label)
         else:
             report["success"] += 1
     return report
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="APEX parallelism benchmark")
-    parser.add_argument("--mock", action="store_true", help="Simulate tasks with sleep (no API)")
-    parser.add_argument("--tasks", type=int, default=4, help="Number of tasks (1–8, default 4)")
-    parser.add_argument("--mock-latency", type=float, default=2.5, help="Simulated task latency in seconds")
-    parser.add_argument("--concurrency", type=int, default=4, help="Max parallel processes per batch (default 4)")
+    parser.add_argument("--mock", action="store_true", help="Simulate tasks without model calls")
+    parser.add_argument("--tasks", type=int, default=4, help="Number of tasks (1-8; default: 4)")
+    parser.add_argument("--mock-latency", type=float, default=2.5, help="Base simulated latency")
+    parser.add_argument("--concurrency", type=int, default=4, help="Maximum concurrent subprocesses")
     args = parser.parse_args()
 
-    n = max(1, min(args.tasks, len(TASKS)))
-    tasks = TASKS[:n]
-    mock = args.mock
-    concurrency = max(1, args.concurrency)
+    task_count = max(1, min(args.tasks, len(TASKS)))
+    concurrency = max(1, min(args.concurrency, task_count))
+    tasks = TASKS[:task_count]
 
-    if not mock:
-        if not os.environ.get("GEMINI_API_KEY"):
+    if not args.mock:
+        provider = os.environ.get("LLM_PROVIDER", "gemini").lower()
+        if provider not in {"gemini", "ollama"}:
+            print(f"ERROR: unsupported LLM_PROVIDER: {provider}", file=sys.stderr)
+            raise SystemExit(1)
+        if provider == "gemini" and not os.environ.get("GEMINI_API_KEY"):
             print("ERROR: GEMINI_API_KEY not set. Use --mock for simulation.", file=sys.stderr)
-            sys.exit(1)
-        if not shutil.which("apex"):
-            print("ERROR: apex not found in PATH. Run: pip install -e .", file=sys.stderr)
-            sys.exit(1)
+            raise SystemExit(1)
 
-    run_fn = (lambda task, out: run_mock_task(task, out, args.mock_latency)) if mock else run_real_task
+    run_fn = (
+        (lambda task, path: run_mock_task(task, path, args.mock_latency))
+        if args.mock
+        else run_real_task
+    )
+    print(
+        f"[benchmark] mode={'mock' if args.mock else 'real'} tasks={task_count} concurrency={concurrency}",
+        file=sys.stderr,
+    )
 
-    print(f"[benchmark] mode={'mock' if mock else 'real'} tasks={n} concurrency={concurrency}", file=sys.stderr)
+    with tempfile.TemporaryDirectory(prefix="apex-parallel-") as work_dir:
+        sequential, sequential_wall = run_sequential(tasks, work_dir, run_fn)
+        parallel, parallel_wall = run_parallel(tasks, work_dir, run_fn, concurrency)
+        sequential_validation = validate_outputs(sequential)
+        parallel_validation = validate_outputs(parallel)
 
-    with tempfile.TemporaryDirectory(prefix="apex-bench-") as work_dir:
-        # Sequential
-        print(f"[benchmark] running {n} tasks sequentially...", file=sys.stderr)
-        seq_results, seq_total = run_sequential(tasks, work_dir, run_fn)
-        seq_validation = validate_outputs(seq_results)
-
-        # Parallel
-        print(f"[benchmark] running {n} tasks in parallel (batch_size={concurrency})...", file=sys.stderr)
-        par_results, par_total = run_parallel_bash(tasks, work_dir, mock, args.mock_latency, concurrency)
-        par_validation = validate_outputs(par_results)
-
-    # Compute speedup
-    speedup = seq_total / par_total if par_total > 0 else float("inf")
-    efficiency = speedup / n  # ideal = 1.0
-
+    speedup = sequential_wall / parallel_wall if parallel_wall > 0 else 0.0
+    ideal_parallelism = min(task_count, concurrency)
+    efficiency = speedup / ideal_parallelism if ideal_parallelism else 0.0
     output = {
         "benchmark": "apex_parallel_codegen",
-        "mode": "mock" if mock else "real",
-        "task_count": n,
+        "mode": "mock" if args.mock else "real",
+        "task_count": task_count,
         "concurrency": concurrency,
         "sequential": {
-            "wall_seconds": round(seq_total, 3),
-            "per_task_seconds": [round(r.duration_seconds, 3) for r in seq_results],
-            "validation": seq_validation,
+            "wall_seconds": round(sequential_wall, 3),
+            "per_task_seconds": [round(result.duration_seconds, 3) for result in sequential],
+            "validation": sequential_validation,
         },
         "parallel": {
-            "wall_seconds": round(par_total, 3),
-            "per_task_seconds": [round(r.duration_seconds, 3) for r in par_results],
-            "validation": par_validation,
+            "wall_seconds": round(parallel_wall, 3),
+            "per_task_seconds": [round(result.duration_seconds, 3) for result in parallel],
+            "validation": parallel_validation,
         },
         "speedup_factor": round(speedup, 2),
         "parallel_efficiency": round(efficiency, 2),
-        "notes": (
-            "Mock mode: speedup reflects process spawn overhead only. "
-            "Real mode: speedup reflects LLM API latency amortization via bash concurrency."
-            if mock else
-            "Real mode: each apex invocation is an isolated process. "
-            "Speedup varies with Gemini API latency and task complexity."
-        ),
     }
-
     print(json.dumps(output, indent=2))
-
-    # Human summary to stderr
-    print(f"\n[result] sequential={seq_total:.2f}s  parallel={par_total:.2f}s  speedup={speedup:.2f}×", file=sys.stderr)
-    if seq_validation["success"] < n or par_validation["success"] < n:
-        print(f"[warning] validation failures detected — check 'missing' and 'empty' fields", file=sys.stderr)
+    print(
+        f"\n[result] sequential={sequential_wall:.2f}s parallel={parallel_wall:.2f}s speedup={speedup:.2f}x",
+        file=sys.stderr,
+    )
+    valid = (
+        sequential_validation["success"] == task_count
+        and parallel_validation["success"] == task_count
+    )
+    raise SystemExit(0 if valid else 1)
 
 
 if __name__ == "__main__":

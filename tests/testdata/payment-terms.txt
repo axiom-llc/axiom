@@ -1,9 +1,0 @@
-Payment Terms
-
-Axiom LLC accepts the following payment methods: major credit and debit cards (Visa, Mastercard, American Express, Discover), PayPal, and bank transfers for annual Enterprise plans.
-
-All prices are listed in USD. For international customers, charges are converted at the exchange rate applied by the customer's payment provider at the time of transaction. Axiom is not responsible for foreign transaction fees imposed by the customer's bank.
-
-Invoices are issued at the start of each billing period and are available for download from the Account Settings > Billing section. Enterprise customers on net-30 terms will receive invoices by email and payment is due within 30 days of the invoice date.
-
-Failed payments will be retried up to 3 times over 7 days. If payment cannot be collected after 3 attempts, the account will be suspended until payment is resolved. Account data is retained for 30 days following suspension before permanent deletion.

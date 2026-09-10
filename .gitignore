@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+.apex/
+.rag/
+chroma/
+chroma-data/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*~
+*.swp
