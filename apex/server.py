@@ -5,6 +5,7 @@ import contextlib
 import hmac
 import io
 import ipaddress
+import json
 import os
 import sys
 from functools import wraps
@@ -12,10 +13,11 @@ from functools import wraps
 from flask import Flask, Response, jsonify, request
 
 from apex.config import load_config
-from apex.core.loop import run
+from apex.core.loop import run, run_plan
+from apex.core.planner import parse_plan
 from apex.core.state import format_output
 from apex.core.toolloader import build_registry
-from apex.core.types import ToolExecution, plan_to_dict
+from apex.core.types import Err, ToolExecution, plan_to_dict
 from apex.history import list_runs, load_run_detail
 
 try:
@@ -89,11 +91,20 @@ def api_run():
     body = _json_body()
     if body is None:
         return jsonify({"error": "JSON object body is required"}), 400
-    task = body.get("task")
-    if not isinstance(task, str) or not task.strip():
-        return jsonify({"error": "task is required"}), 400
-
-    state = run(task.strip(), config=_BASE_CONFIG, registry=_REGISTRY)
+    if ("task" in body) == ("plan" in body):
+        return jsonify({"error": "provide exactly one of task or plan"}), 400
+    if "plan" in body:
+        if not isinstance(body["plan"], dict):
+            return jsonify({"error": "plan must be a JSON object"}), 400
+        plan = parse_plan(json.dumps(body["plan"]), _REGISTRY)
+        if isinstance(plan, Err):
+            return jsonify({"error": plan.message}), 400
+        state = run_plan(plan.goal, plan, config=_BASE_CONFIG, registry=_REGISTRY)
+    else:
+        task = body["task"]
+        if not isinstance(task, str) or not task.strip():
+            return jsonify({"error": "task is required"}), 400
+        state = run(task.strip(), config=_BASE_CONFIG, registry=_REGISTRY)
     exit_code = {"HALTED": 0, "ERROR": 1}.get(state.status, 2)
     return jsonify(
         {

@@ -112,7 +112,7 @@ Limit generated plans to 32 total steps. Require a non-empty goal, validate ever
 
 Build planner tool documentation from the active registry so built-in, memory, user-defined, and MCP tools use the same runtime schema.
 
-Enforce a 300-second timeout per tool call, retry execution failures up to three times, reject non-JSON-serializable tool output, and reject serialized tool output above 10 MiB.
+Enforce a 300-second timeout per tool call, retry failures up to three times only for tools explicitly marked `retry_safe=True` (built-in file/memory reads and HTTP GET), reject non-JSON-serializable tool output, and reject serialized tool output above 10 MiB.
 
 Record the complete validated plan before execution mutates runtime state. Persist each run and its tool events atomically in `APEX_HISTORY_DB_PATH` with SQLite WAL enabled.
 
@@ -159,7 +159,7 @@ Refuse an unauthenticated non-loopback bind. Run the Flask process single-thread
 | Route        | Method | Auth                         | Purpose                                                                           |
 | ------------ | ------ | ---------------------------- | --------------------------------------------------------------------------------- |
 | `/health`    | GET    | none                         | Return status and version.                                                        |
-| `/run`       | POST   | `X-Apex-Key` when configured | Execute `{"task": "..."}` and return the recorded run ID plus the validated plan. |
+| `/run`       | POST   | `X-Apex-Key` when configured | Execute `{"task": "..."}` or an exact `{"plan": {...}}`; return the run ID and validated plan. |
 | `/runs`      | GET    | same                         | Return recent runs with `?n=20`.                                                  |
 | `/runs/<id>` | GET    | same                         | Return one run and its events.                                                    |
 | `/replay`    | POST   | same                         | Replay with `simulate`, `dry`, or `live`.                                         |
@@ -214,9 +214,26 @@ python benchmarks/eval_rag.py --dataset benchmarks/eval_rag_dataset.json
 ```
 
 
+### Exact plan submission
+
+`POST /run` accepts exactly one of `{"task": "..."}` or `{"plan": {...}}`.
+Task requests use the planner as before. Plan requests use the same registry/schema
+validation and existing execution kernel, without an LLM planning call. Invalid
+plans return 400 before any tool runs. A plan requires a non-empty `goal`, typed
+`steps`, and a final halt; the 32-step ceiling includes that halt. Authentication
+and response fields are identical for both request forms. ASON 0.2+ uses this
+interface to preserve its pre-execution policy decisions.
+
+The `apex.core.rag` imports delegate to the canonical `axiom-rag>=1.1.0`
+implementation. APEX retains its existing model defaults through its config
+adapter. Retrieval changes and regressions belong in `axiom-rag`; both packages
+use the same chunking, embedding, storage, and ingestion functions.
+
 ## RSI experiment
 
-Run RSI only on a clean Git working tree you can discard or review. Let each cycle benchmark a baseline, ask the configured LLM provider for candidate unified diffs, reject candidates outside the allowed files or containing blocked shell patterns, benchmark candidates in isolated worktrees, and commit the selected candidate to `rsi/cycle-N`.
+Run RSI from a clean source checkout with development dependencies installed (`pip install -e ".[dev]"`); its regression gate requires pytest. Use a working tree you can discard or review. Let each cycle benchmark a baseline, ask the configured LLM provider for candidate unified diffs, use Git’s patch parser to reject candidates outside the allowed files, binary changes, file creation/deletion, renames/copies, mode changes, or blocked shell patterns, require each candidate to pass offline regression tests before benchmarking in a scratch worktree, and commit the selected candidate to `rsi/cycle-N`.
+
+Candidate tests and each benchmark invocation have a 300-second timeout. Failed tests, failed benchmark processes, and invalid/non-finite scores are ineligible for selection. Worktrees isolate Git changes; they are not an operating-system security sandbox.
 
 Do not auto-merge RSI branches. Review every candidate manually. Keep `apex/core/safety.py` outside the patchable set.
 
@@ -269,3 +286,5 @@ Persist APEX memory and history state in the `apex_data` volume. Deploy any exte
 * Use `axiom-llc.github.io` for the project site.
 
 © AXIOM LLC.
+
+Custom tools default to one execution attempt. Set `retry_safe=True` only when repeating the effect after a timeout or partial failure is safe. Shell, filesystem writes, memory writes, and MCP tools are not retried by default.

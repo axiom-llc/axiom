@@ -88,6 +88,7 @@ def make_memory_tools(db_path: Path) -> tuple[Tool, Tool]:
         output_spec={"entries": list, "key": str, "value": object, "ts": float},
         effect=memory_read_effect,
         required=frozenset(),
+        retry_safe=True,
     )
     memory_write = Tool(
         name="memory_write",

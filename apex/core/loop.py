@@ -117,7 +117,8 @@ def _execute(state: State, config: Config, registry: dict[str, Tool], events: li
         _full_trace(config, {"event": "tool_call", "tool": step.name, "args": step.args})
 
         result: Ok | Err
-        for attempt in range(1, _MAX_RETRIES + 1):
+        max_attempts = _MAX_RETRIES if tool.retry_safe else 1
+        for attempt in range(1, max_attempts + 1):
             try:
                 with _timeout(_TOOL_TIMEOUT_S):
                     output = tool.effect(step.args)
@@ -128,7 +129,7 @@ def _execute(state: State, config: Config, registry: dict[str, Tool], events: li
             except Exception as exc:
                 result = Err("ToolExecutionError", str(exc))
 
-            if attempt < _MAX_RETRIES:
+            if attempt < max_attempts:
                 _full_trace(
                     config,
                     {
@@ -140,7 +141,7 @@ def _execute(state: State, config: Config, registry: dict[str, Tool], events: li
                 )
                 _trace(
                     config,
-                    f"[retry] {step.name} attempt {attempt}/{_MAX_RETRIES}: {result.message}",
+                    f"[retry] {step.name} attempt {attempt}/{max_attempts}: {result.message}",
                 )
                 sleep(_RETRY_DELAY_S * attempt)
 

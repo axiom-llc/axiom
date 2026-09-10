@@ -70,6 +70,7 @@ class Tool:
     output_spec: dict[str, type]
     effect: Callable[[dict], dict]
     required: frozenset[str] | None = None
+    retry_safe: bool = False
 
     @property
     def required_args(self) -> frozenset[str]:

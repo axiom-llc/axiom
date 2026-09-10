@@ -41,6 +41,7 @@ READ_FILE = Tool(
     input_spec={"path": str},
     output_spec={"content": str},
     effect=read_file_effect,
+    retry_safe=True,
 )
 
 WRITE_FILE = Tool(
@@ -56,6 +57,7 @@ HTTP_GET = Tool(
     output_spec={"body": str, "status": int},
     effect=http_get_effect,
     required=frozenset({"url"}),
+    retry_safe=True,
 )
 
 

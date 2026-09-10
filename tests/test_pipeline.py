@@ -47,9 +47,9 @@ def mock_gemini():
     mock_response.text = "Mocked answer from context."
 
     with (
-        patch("apex.core.rag.embedder.embed_texts", side_effect=fake_embed_texts),
-        patch("apex.core.rag.embedder.embed_query", side_effect=fake_embed_query),
-        patch("apex.core.rag.generator.genai") as mock_gen,
+        patch("rag.embedder.embed_texts", side_effect=fake_embed_texts),
+        patch("rag.embedder.embed_query", side_effect=fake_embed_query),
+        patch("rag.generator.genai") as mock_gen,
     ):
         mock_gen.Client.return_value.models.generate_content.return_value = mock_response
         yield
@@ -152,3 +152,9 @@ class TestQuery:
         pipeline.ingest("some searchable content here", doc_id="cc_doc", config=cfg)
         result = pipeline.query("searchable content", cfg)
         assert result["chunk_count"] == len(result["chunks"])
+
+
+def test_retrieval_uses_canonical_rag_implementations():
+    from rag import pipeline as canonical_pipeline, store as canonical_store
+    assert pipeline.ingest is canonical_pipeline.ingest
+    assert store.upsert is canonical_store.upsert

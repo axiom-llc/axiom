@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "axiom-apex"
-version = "3.0.1"
+version = "3.1.0"
 description = "Deterministic AI agent runtime — NL to schema-validated plans to bounded tool execution"
 authors = [{ name = "AXIOM LLC", email = "axiom.co@proton.me" }]
 readme = "README.md"
@@ -24,7 +24,7 @@ dependencies = [
     "flask",
     "requests",
     "google-genai",
-    "chromadb>=0.4.0",
+    "axiom-rag>=1.1.0",
 ]
 
 [project.scripts]

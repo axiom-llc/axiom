@@ -84,8 +84,8 @@ def _apply_patch(patch_text: str) -> bool:
 
 def _run_candidate(
     candidate_idx: int, patch_text: str, tasks_path: str, mock_bench: bool, k: int = 3
-) -> float:
-    """Apply patch in a scratch worktree, benchmark it, discard the worktree."""
+) -> float | None:
+    """Require passing regressions and valid benchmark runs in a scratch worktree."""
     scratch = tempfile.mkdtemp(prefix=f"apex-rsi-cand{candidate_idx}-")
     try:
         _git(["worktree", "add", "--detach", scratch, "HEAD"])
@@ -98,18 +98,33 @@ def _run_candidate(
         )
         os.unlink(patch_path)
         if applied.returncode != 0:
-            return 0.0
+            return None
+        validation = subprocess.run(
+            [sys.executable, "-m", "pytest", "tests", "-m", "not integration", "-q"],
+            cwd=scratch, capture_output=True, text=True, timeout=300,
+        )
+        if validation.returncode != 0:
+            print(f"[rsi] candidate {candidate_idx} failed regression tests", file=sys.stderr)
+            return None
         scores = []
         for _ in range(k):
             cmd = BENCH_CMD + ["--tasks", tasks_path]
             if mock_bench:
                 cmd.append("--mock")
-            result = subprocess.run(cmd, cwd=scratch, capture_output=True, text=True)
+            result = subprocess.run(cmd, cwd=scratch, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                return None
             try:
-                scores.append(json.loads(result.stdout).get("apex_score", 0.0))
-            except json.JSONDecodeError:
-                scores.append(0.0)
-        return sum(scores) / len(scores) if scores else 0.0
+                score = json.loads(result.stdout)["apex_score"]
+                if type(score) not in (int, float) or not 0 <= score <= 1:
+                    return None
+                scores.append(score)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                return None
+        return sum(scores) / len(scores) if scores else None
+    except subprocess.TimeoutExpired:
+        print(f"[rsi] candidate {candidate_idx} validation timed out", file=sys.stderr)
+        return None
     finally:
         _git(["worktree", "remove", "--force", scratch], check=False)
 
@@ -201,6 +216,10 @@ def _generate_patch(api_key: str, sources: str, score: float,
 
 def _validate_patch(patch_text: str) -> bool:
     """Reject unsafe additions and patches outside the explicit RSI allowlist."""
+    if any(line == "GIT binary patch" or line.startswith("Binary files ")
+           for line in patch_text.splitlines()):
+        print("[rsi] binary patches are not permitted", file=sys.stderr)
+        return False
     blocked = (
         re.compile(r"rm\s+-[rf]+\s+/"),
         re.compile(r"chmod\s+777\s+/"),
@@ -220,21 +239,31 @@ def _validate_patch(patch_text: str) -> bool:
             print(f"[rsi] patch contains blocked pattern: {pattern.pattern}", file=sys.stderr)
             return False
 
-    allowed = set(RSI_SOURCE_FILES)
-    targets = []
-    for prefix in ("--- a/", "+++ b/"):
-        targets.extend(
-            line[len(prefix):]
-            for line in patch_text.splitlines()
-            if line.startswith(prefix)
-        )
-    if not targets:
-        print("[rsi] patch contains no file targets", file=sys.stderr)
+    # Ask the same parser used for application: textual header scans miss
+    # unprefixed/quoted paths and metadata-only changes in mixed diffs.
+    parsed = subprocess.run(
+        ["git", "apply", "--numstat", "-z", "-"],
+        input=patch_text, cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    if parsed.returncode != 0 or not parsed.stdout:
+        print("[rsi] patch is malformed or contains no changes", file=sys.stderr)
         return False
-    for target in targets:
-        if target != "/dev/null" and target not in allowed:
-            print(f"[rsi] patch targets non-RSI file: {target}", file=sys.stderr)
+    allowed = set(RSI_SOURCE_FILES)
+    for record in parsed.stdout.rstrip("\0").split("\0"):
+        fields = record.split("\t", 2)
+        if len(fields) != 3 or fields[2] not in allowed or "-" in fields[:2]:
+            print("[rsi] patch contains a non-RSI target or binary change", file=sys.stderr)
             return False
+
+    # RSI edits existing source text only. Reject creation, deletion, renames,
+    # copies and mode changes (including conversion to symbolic links).
+    summary = subprocess.run(
+        ["git", "apply", "--summary", "-"],
+        input=patch_text, cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    if summary.returncode != 0 or summary.stdout:
+        print("[rsi] patch changes file identity or mode", file=sys.stderr)
+        return False
     return True
 
 
@@ -330,6 +359,8 @@ def run_rsi(
                 estimated_tokens = len(patch) // 4 + len(sources) // 4
                 governor.consume_tokens(estimated_tokens)
                 cand_score = _run_candidate(ci, patch, tasks_path, mock_bench, k=3)
+                if cand_score is None:
+                    continue
                 print(f"[rsi] candidate {ci} score={cand_score:.6f}", flush=True)
                 candidates.append((cand_score, patch, estimated_tokens))
 
